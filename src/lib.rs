@@ -270,6 +270,28 @@ impl HsIdExt for HsId {
     }
 }
 
+#[cfg(feature = "listen-onion-service")]
+#[cfg(test)]
+#[test]
+fn to_multiaddr() {
+    use libp2p::multiaddr::multiaddr;
+    let test = HsId::from([0; 32]).to_multiaddr(12345);
+    assert_eq!(
+        test,
+        multiaddr!(Onion3((
+            [
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0xCD, 0x0E, 0x03
+            ],
+            12345
+        )))
+    );
+    assert_eq!(
+        test.to_string(),
+        "/onion3/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaam2dqd:12345"
+    );
+}
+
 impl Transport for TorTransport {
     type Output = TokioTorStream;
     type Error = TorTransportError;
