@@ -283,7 +283,7 @@ impl Transport for TorTransport {
         onion_address: Multiaddr,
     ) -> Result<(), TransportError<Self::Error>> {
         // If the `listen-onion-service` feature is not enabled, we do not support listening
-        Err(TransportError::MultiaddrNotSupported(onion_address.clone()))
+        Err(TransportError::MultiaddrNotSupported(onion_address))
     }
 
     #[cfg(feature = "listen-onion-service")]
@@ -319,8 +319,8 @@ impl Transport for TorTransport {
             TorListener {
                 service,
                 request_stream,
-                onion_address: onion_address.clone(),
                 port: address.port(),
+                onion_address: onion_address,
                 status_stream,
                 announced: false,
             },
@@ -356,7 +356,7 @@ impl Transport for TorTransport {
         };
 
         let tor_address =
-            maybe_tor_addr.ok_or(TransportError::MultiaddrNotSupported(addr.clone()))?;
+            maybe_tor_addr.ok_or_else(|| TransportError::MultiaddrNotSupported(addr.clone()))?;
         let onion_client = self.client.clone();
 
         Ok(Box::pin(async move {
