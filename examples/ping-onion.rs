@@ -52,9 +52,8 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     yamux, Multiaddr, PeerId, SwarmBuilder,
 };
-use libp2p_community_tor::{AddressConversion, TorTransport};
 use std::error::Error;
-use tor_hsservice::config::OnionServiceConfigBuilder;
+use std::sync::{Arc, Mutex};
 
 /// Create a transport
 /// Returns a tuple of the transport and the onion address we can instruct it to listen on
@@ -67,26 +66,13 @@ async fn onion_transport(
     ),
     Box<dyn Error>,
 > {
-    let mut transport = TorTransport::bootstrapped()
-        .await?
-        .with_address_conversion(AddressConversion::IpAndDns);
+    let provider = libp2p_community_tor_interface::tor_interface::legacy_tor_client::LegacyTorClient::new(
+        libp2p_community_tor_interface::tor_interface::legacy_tor_client::LegacyTorClientConfig::system_from_environment().expect("Configure $TOR_... to talk to"))?;
 
-    // We derive the nickname for the onion address from the peer id
-    let svg_cfg = OnionServiceConfigBuilder::default()
-        .nickname(
-            keypair
-                .public()
-                .to_peer_id()
-                .to_base58()
-                .to_ascii_lowercase()
-                .parse()
-                .unwrap(),
-        )
-        .num_intro_points(3)
-        .build()
-        .unwrap();
+    let mut transport = libp2p_community_tor_interface::TorInterfaceTransport::from_provider(
+        libp2p_community_tor_interface::AddressConversion::IpAndDns, Arc::new(Mutex::new(provider)), None)?;
 
-    let onion_listen_address = transport.add_onion_service(svg_cfg, 999).unwrap();
+    let onion_listen_address = transport.add_customised_onion_service(None, 999, None, ([127, 0, 0, 1], 0u16).into()).unwrap().0;
 
     let auth_upgrade = noise::Config::new(&keypair)?;
     let multiplex_upgrade = yamux::Config::default();

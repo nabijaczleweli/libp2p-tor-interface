@@ -17,65 +17,53 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
-use arti_client::{DangerouslyIntoTorAddr, IntoTorAddr, TorAddr};
-use libp2p::{core::multiaddr::Protocol, multiaddr::Onion3Addr, Multiaddr};
-use std::borrow::Cow;
+use libp2p::{core::multiaddr::Protocol, Multiaddr};
+use tor_interface::tor_provider::{OnionAddr, OnionAddrV3, TargetAddr, DomainAddr};
+use tor_interface::tor_crypto::{V3OnionServiceId, Ed25519PublicKey};
 use std::net::SocketAddr;
 
 /// "Dangerously" extract a Tor address from the provided [`Multiaddr`].
 ///
-/// See [`DangerouslyIntoTorAddr`] for details around the safety / privacy considerations.
-pub fn dangerous_extract(multiaddr: &Multiaddr) -> Option<TorAddr> {
+/// Refer tor [arti_client::TorAddr](https://docs.rs/arti-client/latest/arti_client/struct.TorAddr.html) for details around the safety / privacy considerations.
+pub fn dangerous_extract(multiaddr: &Multiaddr) -> Option<TargetAddr> {
     if let Some(tor_addr) = safe_extract(multiaddr) {
         return Some(tor_addr);
     }
 
     let mut protocols = multiaddr.into_iter();
 
-    try_to_socket_addr(&protocols.next()?, &protocols.next()?)?
-        .into_tor_addr_dangerously()
-        .ok()
+    try_to_socket_addr(&protocols.next()?, &protocols.next()?)
 }
 
 /// "Safely" extract a Tor address from the provided [`Multiaddr`].
 ///
-/// See [`IntoTorAddr`] for details around the safety / privacy considerations.
-pub fn safe_extract(multiaddr: &Multiaddr) -> Option<TorAddr> {
+/// Refer tor [arti_client::TorAddr](https://docs.rs/arti-client/latest/arti_client/struct.TorAddr.html) for details around the safety / privacy considerations.
+pub fn safe_extract(multiaddr: &Multiaddr) -> Option<TargetAddr> {
     let mut protocols = multiaddr.into_iter();
 
     let (dom, port) = (protocols.next()?, protocols.next());
-    let (domain, port) = try_to_domain_and_port(&dom, &port)?;
-    (domain.as_ref(), port).into_tor_addr().ok()
-}
-
-fn libp2p_onion_address_to_domain_and_port<'a>(
-    onion_address: &'a Onion3Addr<'_>,
-) -> (Cow<'a, str>, u16) {
-    // Here we convert from Onion3Addr to TorAddr
-    let hash = data_encoding::BASE32.encode(onion_address.hash());
-    let onion_domain = format!("{hash}.onion");
-
-    (onion_domain.into(), onion_address.port())
+    try_to_domain_and_port(&dom, &port)
 }
 
 fn try_to_domain_and_port<'a>(
     maybe_domain: &'a Protocol,
     maybe_port: &Option<Protocol>,
-) -> Option<(Cow<'a, str>, u16)> {
+) -> Option<TargetAddr> {
     match (maybe_domain, maybe_port) {
         (
             Protocol::Dns(domain) | Protocol::Dns4(domain) | Protocol::Dns6(domain),
             Some(Protocol::Tcp(port)),
-        ) => Some((domain.as_ref().into(), *port)),
-        (Protocol::Onion3(domain), _) => Some(libp2p_onion_address_to_domain_and_port(domain)),
+        ) => Some(TargetAddr::Domain(DomainAddr::try_from((domain.to_string(), *port)).ok()?.into())),
+        (Protocol::Onion3(domain), _) =>
+            Some(TargetAddr::OnionService(OnionAddr::V3(OnionAddrV3::new(V3OnionServiceId::from_public_key(&Ed25519PublicKey::from_raw(domain.hash()[..32].try_into().unwrap()).ok()?), domain.port())))),
         _ => None,
     }
 }
 
-fn try_to_socket_addr(maybe_ip: &Protocol, maybe_port: &Protocol) -> Option<SocketAddr> {
+fn try_to_socket_addr(maybe_ip: &Protocol, maybe_port: &Protocol) -> Option<TargetAddr> {
     match (maybe_ip, maybe_port) {
-        (Protocol::Ip4(ip), Protocol::Tcp(port)) => Some(SocketAddr::from((*ip, *port))),
-        (Protocol::Ip6(ip), Protocol::Tcp(port)) => Some(SocketAddr::from((*ip, *port))),
+        (Protocol::Ip4(ip), Protocol::Tcp(port)) => Some(TargetAddr::Socket(SocketAddr::from((*ip, *port)))),
+        (Protocol::Ip6(ip), Protocol::Tcp(port)) => Some(TargetAddr::Socket(SocketAddr::from((*ip, *port)))),
         _ => None,
     }
 }
@@ -83,8 +71,8 @@ fn try_to_socket_addr(maybe_ip: &Protocol, maybe_port: &Protocol) -> Option<Sock
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arti_client::TorAddr;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use tor_interface::tor_provider::TargetAddr;
+    use std::str::FromStr;
 
     #[test]
     fn extract_correct_address_from_dns() {
@@ -92,6 +80,7 @@ mod tests {
             "/dns/ip.tld/tcp/10".parse().unwrap(),
             "/dns4/dns.ip4.tld/tcp/11".parse().unwrap(),
             "/dns6/dns.ip6.tld/tcp/12".parse().unwrap(),
+            "/onion3/cebulka7uxchnbpvmqapg5pfos4ngaxglsktzvha7a5rigndghvadeyd:13".parse().unwrap(),
         ];
 
         let actual = addresses
@@ -101,9 +90,10 @@ mod tests {
 
         assert_eq!(
             &[
-                TorAddr::from(("ip.tld", 10)).unwrap(),
-                TorAddr::from(("dns.ip4.tld", 11)).unwrap(),
-                TorAddr::from(("dns.ip6.tld", 12)).unwrap(),
+                TargetAddr::from_str("ip.tld:10").unwrap(),
+                TargetAddr::from_str("dns.ip4.tld:11").unwrap(),
+                TargetAddr::from_str("dns.ip6.tld:12").unwrap(),
+                TargetAddr::from_str("cebulka7uxchnbpvmqapg5pfos4ngaxglsktzvha7a5rigndghvadeyd.onion:13").unwrap(),
             ],
             actual.as_slice()
         );
@@ -123,8 +113,8 @@ mod tests {
 
         assert_eq!(
             &[
-                TorAddr::dangerously_from((Ipv4Addr::LOCALHOST, 10)).unwrap(),
-                TorAddr::dangerously_from((Ipv6Addr::LOCALHOST, 10)).unwrap(),
+                TargetAddr::from_str("127.0.0.1:10").unwrap(),
+                TargetAddr::from_str("[::1]:10").unwrap(),
             ],
             actual.as_slice()
         );
@@ -145,9 +135,9 @@ mod tests {
 
         assert_eq!(
             &[
-                TorAddr::from(("ip.tld", 10)).unwrap(),
-                TorAddr::dangerously_from((Ipv4Addr::LOCALHOST, 10)).unwrap(),
-                TorAddr::dangerously_from((Ipv6Addr::LOCALHOST, 10)).unwrap(),
+                TargetAddr::from_str("ip.tld:10").unwrap(),
+                TargetAddr::from_str("127.0.0.1:10").unwrap(),
+                TargetAddr::from_str("[::1]:10").unwrap(),
             ],
             actual.as_slice()
         );

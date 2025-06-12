@@ -1,12 +1,12 @@
 [package]
-name = "libp2p-community-tor"
-version = "0.5.0"
+name = "libp2p-community-tor-interface"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
 resolver = "2"
-description = "Tor transport for libp2p."
-repository = "https://github.com/umgefahren/libp2p-tor"
-authors = ["umgefahren <hannes@umgefahren.xyz>"]
+description = "Existing (legacy) Tor control channel/arti automatic Tor client/mock Tor transport for libp2p."
+repository = "https://github.com/nabijaczleweli/libp2p-tor-interface"
+authors = ["наб <nabijaczleweli@nabijaczleweli.xyz>", "umgefahren <hannes@umgefahren.xyz>"]
 
 [dependencies]
 thiserror = "1.0"
@@ -14,34 +14,25 @@ anyhow = "1.0.93"
 tokio = "1.41.1"
 futures = "0.3"
 
-arti-client = { version = "^0.29", default-features = false, features = ["tokio", "rustls", "onion-service-client", "static-sqlite"] }
+tor-interface = { git = "https://github.com/nabijaczleweli/gosling", rev = "65da8990e33c674ed8abeb10b454b4a39463d81d" }
 libp2p = { version = "^0.53", default-features = false, features = ["tokio", "tcp", "tls"] }
+# libp2p = { path = "^0.53", default-features = false, features = ["tokio", "tcp", "tls", "unix-stream"] }
 
-tor-rtcompat = { version = "^0.29", features = ["tokio", "rustls"] }
 tracing = "0.1.40"
-tor-hsservice = { version = "^0.29", optional = true }
-tor-cell = { version = "^0.29", optional = true }
-tor-proto = { version = "^0.29", optional = true }
-data-encoding = { version = "2.6.0" }
 
 [dev-dependencies]
+# libp2p = { version = "0.53", default-features = false, features = ["tokio", "noise", "yamux", "ping", "macros", "tcp", "tls", "unix-stream"] }
 libp2p = { version = "0.53", default-features = false, features = ["tokio", "noise", "yamux", "ping", "macros", "tcp", "tls"] }
 tokio-test = "0.4.4"
-tokio = { version = "1.41.1", features = ["macros"] }
 tracing-subscriber = "0.2"
 
 [features]
-listen-onion-service = [
-    "arti-client/onion-service-service",
-    "dep:tor-hsservice",
-    "dep:tor-cell",
-    "dep:tor-proto"
-]
+arti-client-tor-provider = ["tor-interface/arti-client-tor-provider"]
+legacy-tor-provider      = ["tor-interface/legacy-tor-provider"]
+mock-tor-provider        = ["tor-interface/mock-tor-provider"]
 
 [[example]]
 name = "ping-onion"
-required-features = ["listen-onion-service"]
 
 [package.metadata.docs.rs]
-all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

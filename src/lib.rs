@@ -41,9 +41,14 @@
 //! ## Example
 //! ```no_run
 //! use libp2p::core::Transport;
+//! use std::sync::{Arc, Mutex};
+//! use libp2p_community_tor_interface::tor_interface::tor_provider::TorProvider;
 //! # async fn test_func() -> Result<(), Box<dyn std::error::Error>> {
 //! let address = "/dns/www.torproject.org/tcp/1000".parse()?;
-//! let mut transport = libp2p_community_tor::TorTransport::bootstrapped().await?;
+//! let mut provider = libp2p_community_tor_interface::tor_interface::legacy_tor_client::LegacyTorClient::new(
+//!     libp2p_community_tor_interface::tor_interface::legacy_tor_client::LegacyTorClientConfig::system_from_environment().unwrap())?;
+//! provider.bootstrap()?;
+//! let mut transport = libp2p_community_tor_interface::TorInterfaceTransport::from_provider(Default::default(), Arc::new(Mutex::new(provider)), None);
 //! // we have achieved tor connection
 //! let _conn = transport.dial(address)?.await?;
 //! # Ok(())
@@ -51,65 +56,32 @@
 //! # tokio_test::block_on(test_func());
 //! ```
 
-use arti_client::{TorClient, TorClientBuilder};
 use futures::future::BoxFuture;
+use tor_interface::tor_provider::{self, CircuitToken, TorProvider, OnionListener, OnionAddr};
+use tor_interface::tor_crypto::{V3OnionServiceId, Ed25519PrivateKey, X25519PublicKey};
 use libp2p::{
     core::transport::{ListenerId, TransportEvent},
     Multiaddr, Transport, TransportError,
 };
+
+use std::collections::{BTreeSet, HashMap};
+use std::str::FromStr;
+use tokio::net::TcpListener;
+
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::borrow::Cow;
+use std::net::SocketAddr;
 use std::task::{Context, Poll};
 use thiserror::Error;
-use tor_rtcompat::tokio::TokioRustlsRuntime;
-
-// We only need these imports if the `listen-onion-service` feature is enabled
-#[cfg(feature = "listen-onion-service")]
-use std::collections::HashMap;
-#[cfg(feature = "listen-onion-service")]
-use std::str::FromStr;
-#[cfg(feature = "listen-onion-service")]
-use tor_cell::relaycell::msg::{Connected, End, EndReason};
-#[cfg(feature = "listen-onion-service")]
-use tor_hsservice::{
-    handle_rend_requests, status::OnionServiceStatus, HsId, OnionServiceConfig,
-    RunningOnionService, StreamRequest,
-};
-#[cfg(feature = "listen-onion-service")]
-use tor_proto::stream::IncomingStreamRequest;
 
 mod address;
 mod provider;
 
 use address::{dangerous_extract, safe_extract};
-pub use provider::TokioTorStream;
+pub use provider::OnionStreamStream;
 
-pub type TorError = arti_client::Error;
-
-type PendingUpgrade = BoxFuture<'static, Result<TokioTorStream, TorTransportError>>;
-#[cfg(feature = "listen-onion-service")]
-type OnionServiceStream = futures::stream::BoxStream<'static, StreamRequest>;
-#[cfg(feature = "listen-onion-service")]
-type OnionServiceStatusStream = futures::stream::BoxStream<'static, OnionServiceStatus>;
-
-/// Struct representing an onion address we are listening on for libp2p connections.
-#[cfg(feature = "listen-onion-service")]
-struct TorListener {
-    #[allow(dead_code)] // We need to own this to keep the RunningOnionService alive
-    /// The onion service we are listening on
-    service: Arc<RunningOnionService>,
-    /// The stream of status updates for the onion service
-    status_stream: OnionServiceStatusStream,
-    /// The stream incoming [`StreamRequest`]s
-    request_stream: OnionServiceStream,
-
-    /// The port we are listening on
-    port: u16,
-    /// The onion address we are listening on
-    onion_address: Multiaddr,
-    /// Whether we have already announced this address
-    announced: bool,
-}
+pub use tor_interface;
 
 /// Mode of address conversion.
 /// Refer tor [arti_client::TorAddr](https://docs.rs/arti-client/latest/arti_client/struct.TorAddr.html) for details
@@ -122,84 +94,69 @@ pub enum AddressConversion {
     IpAndDns,
 }
 
-pub struct TorTransport {
+/// Get a [`TorProvider`](`tor_provider::TorProvider`) from [`tor_interface`]
+pub struct TorInterfaceTransport<T: TorProvider> {
     pub conversion_mode: AddressConversion,
-
-    /// The Tor client.
-    client: Arc<TorClient<TokioRustlsRuntime>>,
+    pub provider: Arc<Mutex<T>>,
+    pub circuit: Option<CircuitToken>,
 
     /// Onion services we are listening on.
-    #[cfg(feature = "listen-onion-service")]
-    listeners: HashMap<ListenerId, TorListener>,
+    listeners: HashMap<ListenerId, TcpListener>,
 
-    /// Onion services we are running but currently not listening on
-    #[cfg(feature = "listen-onion-service")]
-    services: Vec<(Arc<RunningOnionService>, OnionServiceStream)>,
+    /// Onion services we are running (implicitly excluded if ListenerId present)
+    services: Vec<(OnionListener, Option<ListenerId>)>,
+
+    /// Services yet to be announced
+    waiting_to_announce: HashMap<ListenerId, OnionAddr>,
+
+    event_backlog: Vec<tor_provider::TorEvent>,
+
+    /// Persistent list of services we already publish
+    ///
+    /// Tor delineates services by onion but libp2p does it by onion:port
+    published_services: BTreeSet<V3OnionServiceId>,
 }
 
-impl TorTransport {
+#[derive(Debug, Error)]
+pub enum TorTransportError {
+    #[error(transparent)]
+    Client(#[from] tor_provider::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(o) => o,
+        Err(e) => e.into_inner(),
+    }
+}
+
+fn bootstrap<T: TorProvider>(provider: &mut T) -> Result<(), tor_provider::Error> {
+    match provider.bootstrap() {
+        Err(tor_provider::Error::Generic(s)) if s.ends_with(" already bootstrapped") => Ok(()),
+        res @ Ok(_) | res @ Err(_) => res,
+    }
+}
+
+impl<T: TorProvider> TorInterfaceTransport<T> {
     /// Creates a new `TorClientBuilder`.
-    ///
-    /// # Panics
-    /// Panics if the current runtime is not a `TokioRustlsRuntime`.
-    pub fn builder() -> TorClientBuilder<TokioRustlsRuntime> {
-        let runtime =
-            TokioRustlsRuntime::current().expect("Couldn't get the current tokio rustls runtime");
-        TorClient::with_runtime(runtime)
-    }
-
-    /// Creates a bootstrapped `TorTransport`
-    ///
-    /// # Errors
-    /// Could return error emitted during Tor bootstrap by Arti.
-    pub async fn bootstrapped() -> Result<Self, TorError> {
-        let builder = Self::builder();
-        let ret = Self::from_builder(&builder, AddressConversion::DnsOnly)?;
-        ret.bootstrap().await?;
-        Ok(ret)
-    }
-
-    /// Builds a `TorTransport` from an Arti `TorClientBuilder` but does not bootstrap it.
-    ///
-    /// # Errors
-    /// Could return error emitted during creation of the `TorClient`.
-    pub fn from_builder(
-        builder: &TorClientBuilder<TokioRustlsRuntime>,
+    pub fn from_provider(
         conversion_mode: AddressConversion,
-    ) -> Result<Self, TorError> {
-        let client = Arc::new(builder.create_unbootstrapped()?);
-
-        Ok(Self::from_client(client, conversion_mode))
-    }
-
-    /// Builds a `TorTransport` from an existing Arti `TorClient`.
-    pub fn from_client(
-        client: Arc<TorClient<TokioRustlsRuntime>>,
-        conversion_mode: AddressConversion,
-    ) -> Self {
-        Self {
-            conversion_mode,
-            client,
-            #[cfg(feature = "listen-onion-service")]
+        provider: Arc<Mutex<T>>,
+        circuit: Option<CircuitToken>
+    ) -> Result<Self, tor_provider::Error> {
+        bootstrap(&mut *lock(&provider))?;
+        Ok(Self {
+            conversion_mode: conversion_mode,
+            provider: provider,
+            circuit: circuit,
             listeners: HashMap::new(),
-            #[cfg(feature = "listen-onion-service")]
             services: Vec::new(),
-        }
-    }
-
-    /// Bootstraps the `TorTransport` into the Tor network.
-    ///
-    /// # Errors
-    /// Could return error emitted during bootstrap by Arti.
-    pub async fn bootstrap(&self) -> Result<(), TorError> {
-        self.client.bootstrap().await
-    }
-
-    /// Set the address conversion mode
-    #[must_use]
-    pub fn with_address_conversion(mut self, conversion_mode: AddressConversion) -> Self {
-        self.conversion_mode = conversion_mode;
-        self
+            waiting_to_announce: Default::default(),
+            event_backlog: Default::default(),
+            published_services: Default::default(),
+        })
     }
 
     /// Call this function to instruct the transport to listen on a specific onion address
@@ -207,75 +164,96 @@ impl TorTransport {
     ///
     /// # Returns
     /// Returns the Multiaddr of the onion address that the transport can be instructed to listen on
-    /// To actually listen on the address, you need to call [`listen_on`] with the returned address
+    /// To actually listen on the address, you need to call [`listen_on()`] with the returned address
+    ///
+    /// # Blocks
+    /// If listening fails with an `LegacyTorNotBootstrapped` error,
+    /// `bootstrap()`s the provider and awaits bootstrap confirtmation
     ///
     /// # Errors
-    /// Returns an error if we cannot get the onion address of the service
-    #[cfg(feature = "listen-onion-service")]
+    /// Returns an error if we couldn't talk to the tor daemon
     pub fn add_onion_service(
         &mut self,
-        svc_cfg: OnionServiceConfig,
-        port: u16,
+        private_key: &Ed25519PrivateKey,
+        virt_port: u16,
+        authorised_clients: Option<&[X25519PublicKey]>,
     ) -> anyhow::Result<Multiaddr> {
-        let (service, request_stream) = self.client.launch_onion_service(svc_cfg)?;
-        let request_stream = Box::pin(handle_rend_requests(request_stream));
+        let ol = self.listener_or_bootstrap(|p| p.listener(private_key, virt_port, authorised_clients))?;
+        self.add_onion_service_impl(private_key, virt_port, ol)
+    }
 
-        let multiaddr = service
-            .onion_name()
-            .ok_or_else(|| anyhow::anyhow!("Onion service has no onion address"))?
-            .to_multiaddr(port);
+    fn listener_or_bootstrap<R, F: FnMut(&mut T) -> Result<R, tor_provider::Error>>(&mut self, mut f: F) -> Result<R, tor_provider::Error> {
+        loop {
+            let attempt = f(&mut lock(&self.provider)); // Moving this into the match clause deadlocks (Guard still borrowed)
+            match attempt {
+                Err(tor_provider::Error::Generic(s)) if s.ends_with(" not bootstrapped") => {
+                    bootstrap(&mut *lock(&self.provider))?;
+                    self.event_backlog.extend(lock(&self.provider).update()?);
+                }
+                res @ Ok(_) | res @ Err(_) => return res,
+            }
+        }
+    }
 
-        self.services.push((service, request_stream));
+    fn add_onion_service_impl(&mut self, private_key: &Ed25519PrivateKey, virt_port: u16, ol: OnionListener) -> anyhow::Result<Multiaddr> {
+        ol.set_nonblocking(true)?;
+
+        self.services.push((ol, None));
+
+        let svid = V3OnionServiceId::from_private_key(&private_key);
+        let multiaddr = svid.to_multiaddr(virt_port);
 
         Ok(multiaddr)
     }
 }
 
-#[derive(Debug, Error)]
-pub enum TorTransportError {
-    #[error(transparent)]
-    Client(#[from] TorError),
-    #[cfg(feature = "listen-onion-service")]
-    #[error(transparent)]
-    Service(#[from] tor_hsservice::ClientError),
-    #[cfg(feature = "listen-onion-service")]
-    #[error("Stream closed before receiving data")]
-    StreamClosed,
-    #[cfg(feature = "listen-onion-service")]
-    #[error("Stream port does not match listener port")]
-    StreamPortMismatch,
-    #[cfg(feature = "listen-onion-service")]
-    #[error("Onion service is broken")]
-    Broken,
+impl TorInterfaceTransport<tor_interface::legacy_tor_client::LegacyTorClient> {
+    /// The generic [`add_onion_service()`] implementation uses the default configuration (known key, listening on `127.0.0.1:0`)
+    pub fn add_customised_onion_service<'pk>(
+        &mut self,
+        private_key: Option<&'pk Ed25519PrivateKey>,
+        virt_port: u16,
+        authorised_clients: Option<&[X25519PublicKey]>,
+        socket_addr: SocketAddr,
+    ) -> anyhow::Result<(Multiaddr, Cow<'pk, Ed25519PrivateKey>)> {
+        let (genpk, ol) = self.listener_or_bootstrap(|p| p.customised_listener(private_key, virt_port, authorised_clients, socket_addr))?;
+        let private_key = private_key.map(Cow::Borrowed).or(genpk.map(Cow::Owned)).unwrap_or_else(|| unreachable!());
+        self.add_onion_service_impl(&private_key, virt_port, ol).map(|ma| (ma, private_key))
+    }
 }
 
-#[cfg(feature = "listen-onion-service")]
 trait HsIdExt {
     fn to_multiaddr(&self, port: u16) -> Multiaddr;
 }
 
-#[cfg(feature = "listen-onion-service")]
-impl HsIdExt for HsId {
-    /// Convert an `HsId` to a `Multiaddr`
+impl HsIdExt for V3OnionServiceId {
+    /// Convert an `V3OnionServiceId` to a `Multiaddr`
     fn to_multiaddr(&self, port: u16) -> Multiaddr {
-        let onion_domain = self.to_string();
-        let onion_without_dot_onion = onion_domain
-            .split('.')
-            .nth(0)
-            .expect("Display formatting of HsId to contain .onion suffix");
-        let multiaddress_string = format!("/onion3/{onion_without_dot_onion}:{port}");
+        // The internal representation of V3OnionServiceId is 52 characters, so we can't re-use it here.
+        let multiaddress_string = format!("/onion3/{self}:{port}");
 
         Multiaddr::from_str(&multiaddress_string)
             .expect("A valid onion address to be convertible to a Multiaddr")
     }
 }
 
-#[cfg(feature = "listen-onion-service")]
+trait OnionAddrExt {
+    fn to_multiaddr(&self) -> Multiaddr;
+}
+
+impl OnionAddrExt for OnionAddr {
+    fn to_multiaddr(&self) -> Multiaddr {
+        let OnionAddr::V3(v3) = self;
+        v3.service_id().to_multiaddr(v3.virt_port())
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn to_multiaddr() {
+    use tor_interface::tor_crypto::Ed25519PublicKey;
     use libp2p::multiaddr::multiaddr;
-    let test = HsId::from([0; 32]).to_multiaddr(12345);
+    let test = V3OnionServiceId::from_public_key(&Ed25519PublicKey::from_raw(&[0; 32]).unwrap()).to_multiaddr(12345);
     assert_eq!(
         test,
         multiaddr!(Onion3((
@@ -292,82 +270,53 @@ fn to_multiaddr() {
     );
 }
 
-impl Transport for TorTransport {
-    type Output = TokioTorStream;
+
+impl<T: TorProvider + Send + Sync + 'static> Transport for TorInterfaceTransport<T> {
     type Error = TorTransportError;
+    type Output = OnionStreamStream;
+    type ListenerUpgrade = std::future::Ready<Result<Self::Output, TorTransportError>>;
     type Dial = BoxFuture<'static, Result<Self::Output, Self::Error>>;
-    type ListenerUpgrade = PendingUpgrade;
 
-    #[cfg(not(feature = "listen-onion-service"))]
-    fn listen_on(
-        &mut self,
-        _id: ListenerId,
-        onion_address: Multiaddr,
-    ) -> Result<(), TransportError<Self::Error>> {
-        // If the `listen-onion-service` feature is not enabled, we do not support listening
-        Err(TransportError::MultiaddrNotSupported(onion_address))
-    }
-
-    #[cfg(feature = "listen-onion-service")]
     fn listen_on(
         &mut self,
         id: ListenerId,
         onion_address: Multiaddr,
     ) -> Result<(), TransportError<Self::Error>> {
         // If the address is not an onion3 address, return an error
-        let Some(libp2p::multiaddr::Protocol::Onion3(address)) = onion_address.into_iter().nth(0)
-        else {
+        if !matches!(onion_address.into_iter().nth(0), Some(libp2p::multiaddr::Protocol::Onion3(_))) {
             return Err(TransportError::MultiaddrNotSupported(onion_address));
-        };
+        }
 
         // Find the running onion service that matches the requested address
-        // If we find it, remove it from [`services`] and insert it into [`listeners`]
-        let position = self
+        // If we find it, tag it in [`services`] and insert it into [`listeners`]
+        let service = self
             .services
-            .iter()
-            .position(|(service, _)| {
-                service.onion_name().map_or(false, |name| {
-                    name.to_multiaddr(address.port()) == onion_address
-                })
-            });
-        let Some(position) = position
+            .iter_mut()
+            .find(|(service, listener_id)| listener_id.is_none() && service.address().to_multiaddr() == onion_address);
+        let Some((service, listener_id)) = service
         else {
             return Err(TransportError::MultiaddrNotSupported(onion_address));
         };
 
-        let (service, request_stream) = self.services.remove(position);
 
-        let status_stream = Box::pin(service.status_events());
+        let listener = service.try_clone_inner().and_then(TcpListener::from_std).map_err(TorTransportError::Io).map_err(TransportError::Other)?;
+        *listener_id = Some(id);
 
-        self.listeners.insert(
-            id,
-            TorListener {
-                service,
-                request_stream,
-                port: address.port(),
-                onion_address,
-                status_stream,
-                announced: false,
-            },
-        );
+        self.listeners.insert(id, listener);
+        self.waiting_to_announce.insert(id, service.address().clone());
 
         Ok(())
     }
 
-    // We do not support removing listeners if the `listen-onion-service` feature is not enabled
-    #[cfg(not(feature = "listen-onion-service"))]
-    fn remove_listener(&mut self, _id: ListenerId) -> bool {
-        false
-    }
-
-    #[cfg(feature = "listen-onion-service")]
     fn remove_listener(&mut self, id: ListenerId) -> bool {
         // Take the listener out of the map. This will stop listening on onion service for libp2p connections (we will not poll it anymore)
         // However, we will not stop the onion service itself because we might want to reuse it later
         // The onion service will be stopped when the transport is dropped
-        if let Some(listener) = self.listeners.remove(&id) {
-            self.services
-                .push((listener.service, listener.request_stream));
+        if let Some(_) = self.listeners.remove(&id) {
+            let Some((_, listener_id)) = self.services.iter_mut().find(|(_, listener_id)| *listener_id == Some(id))
+                else { unreachable!() };
+            *listener_id = None;
+            self.waiting_to_announce.remove(&id);
             return true;
         }
 
@@ -380,16 +329,17 @@ impl Transport for TorTransport {
             AddressConversion::IpAndDns => dangerous_extract(&addr),
         };
 
-        let tor_address =
-            maybe_tor_addr.ok_or_else(|| TransportError::MultiaddrNotSupported(addr.clone()))?;
-        let onion_client = self.client.clone();
+        let Some(tor_address) = maybe_tor_addr
+            else { return Err(TransportError::MultiaddrNotSupported(addr)); };
+        let provider = self.provider.clone();
+        let circuit = self.circuit;
 
         Ok(Box::pin(async move {
-            let stream = onion_client.connect(tor_address).await?;
+            let stream = lock(&provider).connect(tor_address, circuit).map_err(Self::Error::Client)?;
 
             tracing::debug!(%addr, "Established connection to peer through Tor");
 
-            Ok(TokioTorStream::from(stream))
+            OnionStreamStream::from_onion_stream(stream).map_err(Self::Error::Io)
         }))
     }
 
@@ -400,89 +350,59 @@ impl Transport for TorTransport {
         self.dial(addr)
     }
 
-    fn address_translation(&self, _listen: &Multiaddr, _observed: &Multiaddr) -> Option<Multiaddr> {
+    fn address_translation(&self, _: &Multiaddr, _: &Multiaddr) -> Option<Multiaddr> {
         None
     }
 
-    #[cfg(not(feature = "listen-onion-service"))]
-    fn poll(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<TransportEvent<Self::ListenerUpgrade, Self::Error>> {
-        // If the `listen-onion-service` feature is not enabled, we do not support listening
-        Poll::Pending
-    }
-
-    #[cfg(feature = "listen-onion-service")]
     fn poll(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<TransportEvent<Self::ListenerUpgrade, Self::Error>> {
-        for (listener_id, listener) in &mut self.listeners {
-            // Check if the service has any new statuses
-            if let Poll::Ready(Some(status)) = listener.status_stream.as_mut().poll_next(cx) {
-                tracing::debug!(
-                    status = ?status.state(),
-                    address = listener.onion_address.to_string(),
-                    "Onion service status changed"
-                );
+        while !&self.event_backlog.is_empty() {
+            match self.event_backlog.swap_remove(0) {
+                tor_provider::TorEvent::BootstrapStatus { .. } => {}
+                tor_provider::TorEvent::BootstrapComplete => tracing::debug!("Tor bootstrap complete"),
+                tor_provider::TorEvent::LogReceived { line } => tracing::debug!(%line),
+                tor_provider::TorEvent::OnionServicePublished { service_id } => { self.published_services.insert(service_id); },
             }
+        }
 
-            // Check if we have already announced this address, if not, do it now
-            if !listener.announced {
-                listener.announced = true;
+        // This is HashMap::extract_if() but that's unstable rn; not perf-sensitive (self.waiting_to_announce.len() is almost always 0)
+        if let Some(listener_id) = self.waiting_to_announce.iter().find(|(_, addr)| {
+            let OnionAddr::V3(addr) = addr;
+            self.published_services.contains(addr.service_id())
+        }).map(|(listener_id, _)| listener_id).copied() {
+            return Poll::Ready(TransportEvent::NewAddress {
+                listener_id,
+                listen_addr: self.waiting_to_announce.remove(&listener_id).unwrap(/*key from find()*/).to_multiaddr(),
+            });
+        }
 
-                // We announce the address here to the swarm even though we technically cannot guarantee
-                // that the address is reachable yet from the outside. We might not have registered the
-                // onion service fully yet (introduction points, hsdir, ...)
-                //
-                // However, we need to announce it now because otherwise libp2p might not poll the listener
-                // again and we will not be able to announce it later.
-                // TODO: Find out why this is the case, if this is intended behaviour or a bug
-                return Poll::Ready(TransportEvent::NewAddress {
-                    listener_id: *listener_id,
-                    listen_addr: listener.onion_address.clone(),
-                });
-            }
+        let new_events = lock(&self.provider).update().unwrap_or(vec![]);
+        self.event_backlog.extend(new_events);
+        if !self.event_backlog.is_empty() {
+            return self.poll(cx);
+        }
 
-            match listener.request_stream.as_mut().poll_next(cx) {
-                Poll::Ready(Some(request)) => {
-                    let port = listener.port;
-                    let upgrade: PendingUpgrade = Box::pin(async move {
-                        // Check if the port matches what we expect
-                        if let IncomingStreamRequest::Begin(begin) = request.request() {
-                            if begin.port() != port {
-                                // Reject the connection with CONNECTREFUSED
-                                request
-                                    .reject(End::new_with_reason(EndReason::CONNECTREFUSED))
-                                    .await?;
-
-                                return Err(TorTransportError::StreamPortMismatch);
-                            }
-                        }
-
-                        // Accept the stream and forward it to the swarm
-                        let data_stream = request.accept(Connected::new_empty()).await?;
-                        Ok(TokioTorStream::from(data_stream))
-                    });
+        for (&listener_id, listener) in &mut self.listeners {
+            match listener.poll_accept(cx) {
+                Poll::Ready(Ok((caller, _))) => {
+                    let service_addr = self.services.iter().find(|(_, li)| *li == Some(listener_id)).map(|(ol, _)| ol.address());
+                    let multi = service_addr.map(|ra| ra.to_multiaddr()).unwrap_or(Multiaddr::empty());
 
                     return Poll::Ready(TransportEvent::Incoming {
-                        listener_id: *listener_id,
-                        upgrade,
-                        local_addr: listener.onion_address.clone(),
-                        send_back_addr: listener.onion_address.clone(),
+                        listener_id,
+                        upgrade: std::future::ready(Ok((caller, service_addr.cloned()).into())),
+                        local_addr: multi.clone(),
+                        send_back_addr: multi,
                     });
                 }
 
-                // The stream has ended
-                // This means that the onion service was shut down, and we will not receive any more connections on it
-                Poll::Ready(None) => {
-                    return Poll::Ready(TransportEvent::ListenerClosed {
-                        listener_id: *listener_id,
-                        reason: Ok(()),
-                    });
+                Poll::Ready(Err(err)) => {
+                    return Poll::Ready(TransportEvent::ListenerError { listener_id, error: err.into() });
                 }
-                Poll::Pending => {}
+
+                Poll::Pending => {},
             }
         }
 

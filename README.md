@@ -26,7 +26,7 @@ are dealing with.
 ### Add to your dependencies
 
 ```bash
-cargo add libp2p-community-tor
+cargo add libp2p-community-tor-interface
 ```
 
 This crate uses tokio with rustls for its runtime and TLS implementation.
@@ -38,6 +38,8 @@ No other combinations are supported.
 ### Example
 ```rust
 let address = "/dns/www.torproject.org/tcp/1000".parse()?;
+let mut provider = libp2p_community_tor_interface::tor_interface::/* whichever one you want */;
+let mut transport = libp2p_community_tor_interface::TorInterfaceTransport::from_provider(Default::default(), Arc::new(Mutex::new(provider)), None);
 let mut transport = libp2p_community_tor::TorTransport::bootstrapped().await?;
 // we have achieved tor connection
 let _conn = transport.dial(address)?.await?;
