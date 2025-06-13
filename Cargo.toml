@@ -24,7 +24,7 @@ tracing = "0.1.40"
 # libp2p = { version = "0.53", default-features = false, features = ["tokio", "noise", "yamux", "ping", "macros", "tcp", "tls", "unix-stream"] }
 libp2p = { version = "0.53", default-features = false, features = ["tokio", "noise", "yamux", "ping", "macros", "tcp", "tls"] }
 tokio-test = "0.4.4"
-tracing-subscriber = "0.2"
+tracing-subscriber = "0.3"
 
 [features]
 arti-client-tor-provider = ["tor-interface/arti-client-tor-provider"]
