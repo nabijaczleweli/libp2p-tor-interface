@@ -9,7 +9,7 @@ repository = "https://github.com/nabijaczleweli/libp2p-tor-interface"
 authors = ["наб <nabijaczleweli@nabijaczleweli.xyz>", "umgefahren <hannes@umgefahren.xyz>"]
 
 [dependencies]
-thiserror = "1.0"
+thiserror = "2.0"
 anyhow = "1.0.93"
 tokio = "1.41.1"
 futures = "0.3"
