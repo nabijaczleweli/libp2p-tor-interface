@@ -15,14 +15,14 @@ tokio = "1.41.1"
 futures = "0.3"
 
 tor-interface = { git = "https://github.com/nabijaczleweli/gosling", rev = "65da8990e33c674ed8abeb10b454b4a39463d81d" }
-libp2p = { version = "^0.53", default-features = false, features = ["tokio", "tcp", "tls"] }
+libp2p = { version = "^0.56", default-features = false, features = ["tokio", "tcp", "tls"] }
 # libp2p = { path = "^0.53", default-features = false, features = ["tokio", "tcp", "tls", "unix-stream"] }
 
 tracing = "0.1.40"
 
 [dev-dependencies]
 # libp2p = { version = "0.53", default-features = false, features = ["tokio", "noise", "yamux", "ping", "macros", "tcp", "tls", "unix-stream"] }
-libp2p = { version = "0.53", default-features = false, features = ["tokio", "noise", "yamux", "ping", "macros", "tcp", "tls"] }
+libp2p = { version = "0.56", default-features = false, features = ["tokio", "noise", "yamux", "ping", "macros", "tcp", "tls"] }
 tokio-test = "0.4.4"
 tracing-subscriber = "0.2"
 
